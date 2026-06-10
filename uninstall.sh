@@ -9,9 +9,11 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-echo "==> Stopping and removing service..."
+echo "==> Stopping and removing services..."
 systemctl disable --now dnstt-server 2>/dev/null || true
+systemctl disable --now hev-socks5 2>/dev/null || true
 rm -f /etc/systemd/system/dnstt-server.service
+rm -f /etc/systemd/system/hev-socks5.service
 systemctl daemon-reload
 
 echo "==> Removing files in /opt/dnstt (keeping keys backup)..."
@@ -22,5 +24,4 @@ if [[ -f /opt/dnstt/server.pub ]]; then
 fi
 rm -rf /opt/dnstt
 
-echo "==> Done. The SSH 'vpn' user (if created) was left in place."
-echo "    Remove it manually with: userdel -r vpn"
+echo "==> Done."

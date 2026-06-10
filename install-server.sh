@@ -2,31 +2,38 @@
 #
 # install-server.sh — set up a DNS-over-Tunnel (dnstt) server on a VPS.
 #
+# Architecture:
+#   Internet/DNS --(UDP/53)--> dnstt-server --(single stream)-->
+#       127.0.0.1:1080  hev-socks5-server (SOCKS5 + UDP-in-TCP)  --> Internet
+#
+#   The Android app runs dnstt-client locally, which exposes a SOCKS5
+#   endpoint, and routes the whole TUN device through it with hev's
+#   tun2socks (udp: 'tcp'). SSH is NOT used — it cannot carry UDP/DNS
+#   over dnstt's single reliable stream.
+#
 # Usage:
-#   sudo bash install-server.sh <tunnel-domain> [ssh-user]
+#   sudo bash install-server.sh <tunnel-domain> [proxy-user] [proxy-pass]
 #
-# Example:
-#   sudo bash install-server.sh t.example.com vpn
-#
-# What it does:
-#   1. Installs build deps + Go (if missing) and an SSH server.
-#   2. Clones and builds dnstt-server.
-#   3. Generates a server keypair (prints the public key).
-#   4. Creates a dedicated SSH user for the VPN.
-#   5. Installs and starts a systemd service that listens on UDP/53 and
-#      forwards the tunneled stream to the local SSH server (127.0.0.1:22).
+# Examples:
+#   sudo bash install-server.sh t.example.com               # no auth
+#   sudo bash install-server.sh t.example.com vpn s3cret     # with auth
+#   sudo bash install-server.sh t.example.com vpn            # auto password
 #
 set -euo pipefail
 
 TUNNEL_DOMAIN="${1:-}"
-SSH_USER="${2:-vpn}"
-DNSTT_REPO="https://www.bamsoftware.com/git/dnstt.git"
+PROXY_USER="${2:-}"
+PROXY_PASS="${3:-}"
+
 PREFIX="/opt/dnstt"
 GO_VERSION="1.22.5"
+DNSTT_ZIP_URL="https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip"
+HEV_REPO="https://github.com/heiher/hev-socks5-server"
+SOCKS_PORT="1080"
 
 if [[ -z "$TUNNEL_DOMAIN" ]]; then
   echo "ERROR: tunnel domain required." >&2
-  echo "Usage: sudo bash install-server.sh <tunnel-domain> [ssh-user]" >&2
+  echo "Usage: sudo bash install-server.sh <tunnel-domain> [proxy-user] [proxy-pass]" >&2
   exit 1
 fi
 
@@ -35,8 +42,17 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
+# If a user was given but no password, generate one.
+if [[ -n "$PROXY_USER" && -z "$PROXY_PASS" ]]; then
+  PROXY_PASS="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+fi
+
 echo "==> Tunnel domain : $TUNNEL_DOMAIN"
-echo "==> SSH VPN user  : $SSH_USER"
+if [[ -n "$PROXY_USER" ]]; then
+  echo "==> Proxy auth    : enabled (user '$PROXY_USER')"
+else
+  echo "==> Proxy auth    : disabled (localhost-only SOCKS)"
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -45,9 +61,9 @@ echo
 echo "==> Installing dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y git curl ca-certificates openssh-server iptables
+apt-get install -y git curl ca-certificates unzip iptables build-essential
 
-# Install Go if not present or too old.
+# Install Go if not present.
 if ! command -v go >/dev/null 2>&1; then
   echo "==> Installing Go ${GO_VERSION}..."
   ARCH="$(dpkg --print-architecture)"
@@ -63,15 +79,20 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 export PATH="$PATH:/usr/local/go/bin"
 
+mkdir -p "$PREFIX"
+
 # ---------------------------------------------------------------------------
-# 2. Build dnstt-server
+# 2. Build dnstt-server (from the release zip — the git server is flaky)
 # ---------------------------------------------------------------------------
 echo "==> Building dnstt-server..."
-mkdir -p "$PREFIX"
-if [[ ! -d "$PREFIX/src/.git" ]]; then
-  git clone "$DNSTT_REPO" "$PREFIX/src"
-else
-  git -C "$PREFIX/src" pull --ff-only || true
+if [[ ! -d "$PREFIX/src/dnstt-server" ]]; then
+  curl -fsSL "$DNSTT_ZIP_URL" -o /tmp/dnstt.zip
+  rm -rf "$PREFIX/src"
+  mkdir -p "$PREFIX/src"
+  unzip -q /tmp/dnstt.zip -d /tmp/dnstt-src
+  # The zip extracts to a versioned dir; move its contents into src/.
+  mv /tmp/dnstt-src/*/* "$PREFIX/src/"
+  rm -rf /tmp/dnstt-src /tmp/dnstt.zip
 fi
 ( cd "$PREFIX/src/dnstt-server" && go build -o "$PREFIX/dnstt-server" )
 echo "    built: $PREFIX/dnstt-server"
@@ -89,25 +110,65 @@ fi
 SERVER_PUBKEY="$(cat "$PREFIX/server.pub")"
 
 # ---------------------------------------------------------------------------
-# 4. Dedicated SSH user
+# 4. Build hev-socks5-server (SOCKS5 with UDP-in-TCP support)
 # ---------------------------------------------------------------------------
-if ! id "$SSH_USER" >/dev/null 2>&1; then
-  echo "==> Creating SSH user '$SSH_USER'..."
-  useradd -m -s /bin/false "$SSH_USER"
-  echo "==> Set a password for '$SSH_USER':"
-  passwd "$SSH_USER"
+echo "==> Building hev-socks5-server..."
+if [[ ! -d "$PREFIX/hev-socks5-server/.git" ]]; then
+  rm -rf "$PREFIX/hev-socks5-server"
+  git clone --recursive "$HEV_REPO" "$PREFIX/hev-socks5-server"
+else
+  git -C "$PREFIX/hev-socks5-server" pull --ff-only || true
+  git -C "$PREFIX/hev-socks5-server" submodule update --init --recursive
 fi
-
-# Make sure the SSH server is running and permits the tunneling we need.
-systemctl enable --now ssh
+make -C "$PREFIX/hev-socks5-server" -j"$(nproc)"
+install -m 0755 "$PREFIX/hev-socks5-server/bin/hev-socks5-server" "$PREFIX/hev-socks5-server-bin"
+echo "    built: $PREFIX/hev-socks5-server-bin"
 
 # ---------------------------------------------------------------------------
-# 5. systemd service
+# 5. hev-socks5-server config + systemd unit
 # ---------------------------------------------------------------------------
-echo "==> Installing systemd service..."
+echo "==> Writing hev-socks5-server config..."
+{
+  echo "main:"
+  echo "  workers: 2"
+  echo "  port: ${SOCKS_PORT}"
+  echo "  listen-address: '127.0.0.1'"
+  echo
+  if [[ -n "$PROXY_USER" ]]; then
+    echo "auth:"
+    echo "  username: '${PROXY_USER}'"
+    echo "  password: '${PROXY_PASS}'"
+    echo
+  fi
+  echo "misc:"
+  echo "  log-file: stderr"
+  echo "  log-level: warn"
+} > "$PREFIX/hev-socks5.yml"
+chmod 600 "$PREFIX/hev-socks5.yml"
+
+cat > /etc/systemd/system/hev-socks5.service <<EOF
+[Unit]
+Description=hev-socks5-server (SOCKS5 backend for dnstt)
+After=network.target
+
+[Service]
+ExecStart=${PREFIX}/hev-socks5-server-bin ${PREFIX}/hev-socks5.yml
+Restart=on-failure
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ---------------------------------------------------------------------------
+# 6. dnstt-server systemd service (forwards to the SOCKS5 backend)
+# ---------------------------------------------------------------------------
+echo "==> Installing dnstt-server systemd service..."
 sed \
   -e "s#__PREFIX__#${PREFIX}#g" \
   -e "s#__DOMAIN__#${TUNNEL_DOMAIN}#g" \
+  -e "s#__SOCKS_PORT__#${SOCKS_PORT}#g" \
   "$(dirname "$0")/dnstt-server.service" > /etc/systemd/system/dnstt-server.service
 
 # Allow UDP/53 inbound.
@@ -123,9 +184,10 @@ if ss -lunp 2>/dev/null | grep -q ':53 '; then
 fi
 
 systemctl daemon-reload
+systemctl enable --now hev-socks5
 systemctl enable --now dnstt-server
 sleep 1
-systemctl --no-pager --full status dnstt-server | head -n 12 || true
+systemctl --no-pager --full status dnstt-server | head -n 10 || true
 
 # ---------------------------------------------------------------------------
 # Done
@@ -133,22 +195,41 @@ systemctl --no-pager --full status dnstt-server | head -n 12 || true
 cat <<EOF
 
 ============================================================================
- dnstt-server is running.
+ dnstt-server + hev-socks5-server are running.
 
  Tunnel domain      : ${TUNNEL_DOMAIN}
- Forwarding to      : 127.0.0.1:22  (local SSH)
- SSH user           : ${SSH_USER}
+ Forwarding to      : 127.0.0.1:${SOCKS_PORT}  (hev-socks5-server)
+EOF
+if [[ -n "$PROXY_USER" ]]; then
+cat <<EOF
+ Proxy username     : ${PROXY_USER}
+ Proxy password     : ${PROXY_PASS}
+EOF
+else
+cat <<EOF
+ Proxy auth         : none (localhost-only)
+EOF
+fi
+cat <<EOF
 
  >>> SERVER PUBLIC KEY (enter this in the Android app) <<<
  ${SERVER_PUBKEY}
 
+ Enter these in the Android app:
+   Tunnel domain    : ${TUNNEL_DOMAIN}
+   Resolver         : 1.1.1.1:53  (or your preferred public resolver)
+   Server pubkey    : ${SERVER_PUBKEY}
+EOF
+if [[ -n "$PROXY_USER" ]]; then
+cat <<EOF
+   Proxy username   : ${PROXY_USER}
+   Proxy password   : ${PROXY_PASS}
+EOF
+fi
+cat <<EOF
+
  Next:
    1. Make sure DNS delegation points ${TUNNEL_DOMAIN} at this VPS.
       See DNS-SETUP.md.
-   2. Test from your laptop:
-        dnstt-client -udp 1.1.1.1:53 \\
-            -pubkey ${SERVER_PUBKEY} \\
-            ${TUNNEL_DOMAIN} 127.0.0.1:7300
-        ssh -p 7300 ${SSH_USER}@127.0.0.1
 ============================================================================
 EOF
