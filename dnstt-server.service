@@ -1,0 +1,20 @@
+[Unit]
+Description=dnstt DNS tunnel server
+After=network.target
+
+[Service]
+# Listen on UDP/53 for tunneled DNS queries to the delegated domain and
+# forward the decoded stream to the local SSH server.
+ExecStart=__PREFIX__/dnstt-server \
+    -udp :53 \
+    -privkey-file __PREFIX__/server.key \
+    __DOMAIN__ \
+    127.0.0.1:22
+
+Restart=on-failure
+RestartSec=2
+# Runs as root so it can bind the privileged port 53 and read the key.
+User=root
+
+[Install]
+WantedBy=multi-user.target
