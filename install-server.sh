@@ -165,11 +165,27 @@ EOF
 # 6. dnstt-server systemd service (forwards to the SOCKS5 backend)
 # ---------------------------------------------------------------------------
 echo "==> Installing dnstt-server systemd service..."
-sed \
-  -e "s#__PREFIX__#${PREFIX}#g" \
-  -e "s#__DOMAIN__#${TUNNEL_DOMAIN}#g" \
-  -e "s#__SOCKS_PORT__#${SOCKS_PORT}#g" \
-  "$(dirname "$0")/dnstt-server.service" > /etc/systemd/system/dnstt-server.service
+cat > /etc/systemd/system/dnstt-server.service <<EOF
+[Unit]
+Description=dnstt DNS tunnel server
+After=network.target
+
+[Service]
+# Listen on UDP/53 for tunneled DNS queries to the delegated domain and
+# forward the decoded stream to the local hev-socks5-server backend.
+ExecStart=${PREFIX}/dnstt-server \\
+    -udp :53 \\
+    -privkey-file ${PREFIX}/server.key \\
+    ${TUNNEL_DOMAIN} \\
+    127.0.0.1:${SOCKS_PORT}
+Restart=on-failure
+RestartSec=2
+# Runs as root so it can bind the privileged port 53 and read the key.
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # Allow UDP/53 inbound.
 iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || \
